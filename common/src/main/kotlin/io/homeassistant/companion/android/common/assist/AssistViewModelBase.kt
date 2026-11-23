@@ -61,6 +61,21 @@ sealed interface AssistEvent {
 }
 
 /**
+ * One pipeline run started by [AssistViewModelBase.runAssistPipelineInternal].
+ *
+ * Starting a new run (for example tapping the microphone while a reply is still streaming) does not
+ * cancel the previous one: it keeps delivering its messages, so its reply can still be completed in
+ * its own message. It is [isSuperseded] though, and from then on it no longer touches the state it
+ * shares with the newer run: the recording, TTS playback, the conversation id and continuing the
+ * conversation.
+ */
+class AssistPipelineRun internal constructor() {
+    /** Whether a newer run was started since this one, or the pipeline data was cleared. */
+    var isSuperseded: Boolean = false
+        internal set
+}
+
+/**
  * Upper bound for the audio sent in a single binary frame (1s at [VOICE_SAMPLE_RATE], 16-bit mono).
  * Queued chunks are batched into one frame up to this size so a slow send never has to be
  * repeated once per 10ms chunk.
@@ -128,9 +143,14 @@ abstract class AssistViewModelBase(
     abstract fun getInput(): AssistInputMode?
     abstract fun setInput(inputMode: AssistInputMode)
 
+    /** The most recent pipeline run, the only one allowed to update shared state. */
+    private var latestRun: AssistPipelineRun? = null
+
     protected fun clearPipelineData() {
         binaryHandlerId = null
         conversationId = null
+        latestRun?.isSuperseded = true
+        latestRun = null
     }
 
     private var currentPlayAudioJob: Job? = null
@@ -144,15 +164,23 @@ abstract class AssistViewModelBase(
      * @param text input to run an intent pipeline with, or `null` to run a STT pipeline (check if
      * STT is supported _before_ calling this function)
      * @param pipeline information about the pipeline, or `null` to use the server's default
-     * @param onEvent callback for events that should be use to update the UI
+     * @param onEvent callback for events that should be use to update the UI, called with the
+     * [AssistPipelineRun] the event belongs to. A superseded run still reports its messages, so they can
+     * be shown in that run's own messages.
      */
     protected fun runAssistPipelineInternal(
         text: String?,
         pipeline: AssistPipelineResponse?,
         wakeWordPhrase: String? = null,
-        onEvent: (AssistEvent) -> Unit,
+        onEvent: AssistPipelineRun.(AssistEvent) -> Unit,
     ) {
         val isVoice = text == null
+        val run = AssistPipelineRun()
+        latestRun?.isSuperseded = true
+        latestRun = run
+        // A request from the superseded run to continue the conversation is not this run's
+        continueConversation.set(false)
+        val emit: (AssistEvent) -> Unit = { event -> run.onEvent(event) }
         var job: Job? = null
         job = viewModelScope.launch {
             val flow = try {
@@ -179,41 +207,55 @@ abstract class AssistViewModelBase(
             }
 
             flow?.collect { event ->
+                // A superseded run only reports its messages: the recording, playback and
+                // conversation state belong to the newer run
+                val isLatest = !run.isSuperseded
                 when (event.type) {
                     AssistPipelineEventType.RUN_START -> {
-                        handleRunStart(
-                            event.data as? AssistPipelineRunStart,
-                            isVoice,
-                            onEvent,
-                        )
-                        onEvent(AssistEvent.PipelineStarted)
+                        if (isLatest) {
+                            handleRunStart(
+                                event.data as? AssistPipelineRunStart,
+                                isVoice,
+                                emit,
+                            )
+                        }
+                        emit(AssistEvent.PipelineStarted)
                     }
 
-                    AssistPipelineEventType.STT_START -> handleSttStart()
-                    AssistPipelineEventType.STT_END -> handleSttEnd(event.data as? AssistPipelineSttEnd, onEvent)
+                    AssistPipelineEventType.STT_START -> if (isLatest) handleSttStart()
+                    AssistPipelineEventType.STT_END -> handleSttEnd(
+                        event.data as? AssistPipelineSttEnd,
+                        isLatest,
+                        emit,
+                    )
                     AssistPipelineEventType.INTENT_PROGRESS -> handleIntentProgress(
                         event.data as? AssistPipelineIntentProgress,
-                        onEvent,
+                        emit,
                     )
 
                     AssistPipelineEventType.INTENT_END -> handleIntentEnd(
                         event.data as? AssistPipelineIntentEnd,
-                        onEvent,
+                        isLatest,
+                        emit,
                     )
 
-                    AssistPipelineEventType.TTS_END -> handleTtsEnd(
-                        event.data as? AssistPipelineTtsEnd,
-                        isVoice,
-                        onEvent,
-                    )
-
-                    AssistPipelineEventType.RUN_END -> {
-                        stopRecording(sendRecorded = false)
-                        job?.cancel()
-                        onEvent(AssistEvent.PipelineEnded)
+                    AssistPipelineEventType.TTS_END -> if (isLatest) {
+                        handleTtsEnd(
+                            event.data as? AssistPipelineTtsEnd,
+                            isVoice,
+                            emit,
+                        )
                     }
 
-                    AssistPipelineEventType.ERROR -> if (handleError(event.data as? AssistPipelineError, onEvent)) {
+                    AssistPipelineEventType.RUN_END -> {
+                        if (isLatest) stopRecording(sendRecorded = false)
+                        job?.cancel()
+                        emit(AssistEvent.PipelineEnded)
+                    }
+
+                    AssistPipelineEventType.ERROR -> if (
+                        handleError(event.data as? AssistPipelineError, isLatest, emit)
+                    ) {
                         job?.cancel()
                     }
 
@@ -222,7 +264,7 @@ abstract class AssistViewModelBase(
                     }
                 }
             } ?: run {
-                onEvent(AssistEvent.Message.Output(app.getString(R.string.assist_error)))
+                emit(AssistEvent.Message.Output(app.getString(R.string.assist_error)))
             }
         }
     }
@@ -265,9 +307,10 @@ abstract class AssistViewModelBase(
         }
     }
 
-    private fun handleSttEnd(data: AssistPipelineSttEnd?, onEvent: (AssistEvent) -> Unit) {
-        // The server has finished transcribing: anything still queued is useless to it
-        stopRecording(sendRecorded = false)
+    private fun handleSttEnd(data: AssistPipelineSttEnd?, isLatest: Boolean, onEvent: (AssistEvent) -> Unit) {
+        // The server has finished transcribing: anything still queued is useless to it. The
+        // recording of a newer run is left alone.
+        if (isLatest) stopRecording(sendRecorded = false)
         data?.sttOutput?.get("text")?.let { text ->
             onEvent(AssistEvent.Message.Input(text as String))
         }
@@ -279,10 +322,12 @@ abstract class AssistViewModelBase(
         }
     }
 
-    private fun handleIntentEnd(data: AssistPipelineIntentEnd?, onEvent: (AssistEvent) -> Unit) {
+    private fun handleIntentEnd(data: AssistPipelineIntentEnd?, isLatest: Boolean, onEvent: (AssistEvent) -> Unit) {
         val intentOutput = data?.intentOutput ?: return
-        conversationId = intentOutput.conversationId
-        continueConversation.set(intentOutput.continueConversation)
+        if (isLatest) {
+            conversationId = intentOutput.conversationId
+            continueConversation.set(intentOutput.continueConversation)
+        }
         intentOutput.response.speech?.plain?.get("speech")?.let { speech ->
             onEvent(AssistEvent.Message.Output(speech))
         }
@@ -314,16 +359,19 @@ abstract class AssistViewModelBase(
     /**
      * Return true if we need to cancel the job
      */
-    private fun handleError(data: AssistPipelineError?, onEvent: (AssistEvent) -> Unit): Boolean {
+    private fun handleError(data: AssistPipelineError?, isLatest: Boolean, onEvent: (AssistEvent) -> Unit): Boolean {
         if (data?.isDuplicatedWakeWord == true) {
+            // A superseded run must not dismiss Assist while the newer run is in use
+            if (!isLatest) return true
             Timber.d("Duplicate wake-up detected, dismissing Assist")
             onEvent(AssistEvent.Dismiss)
             stopRecording(sendRecorded = false)
             return true
         }
         val errorMessage = data?.message ?: return false
+        // Shown in the run's own message; the recording belongs to the latest run only
         onEvent(AssistEvent.Message.Error(errorMessage))
-        stopRecording(sendRecorded = false)
+        if (isLatest) stopRecording(sendRecorded = false)
         return true
     }
 

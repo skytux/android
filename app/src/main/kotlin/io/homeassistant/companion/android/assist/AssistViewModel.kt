@@ -479,7 +479,22 @@ class AssistViewModel internal constructor(
         _conversation.add(userMessage)
         val haMessage = AssistMessage.placeholder(isInput = false)
         if (!isVoice) _conversation.add(haMessage)
+        // The message of this run to update. AssistMessage is a data class: the placeholders of
+        // different runs are equal, so it is found by identity, never by value or by position (a newer
+        // run may have added messages since, and an older run may still be streaming its reply).
         var message = if (isVoice) userMessage else haMessage
+        var hasReplyChunk = false
+
+        fun indexOfMessage(): Int = _conversation.indexOfFirst { it === message }
+
+        /** Replaces this run's message with [updated], unless it was removed (conversation cleared). */
+        fun updateMessage(updated: AssistMessage): Boolean {
+            val index = indexOfMessage()
+            if (index < 0) return false
+            _conversation[index] = updated
+            message = updated
+            return true
+        }
 
         // Capture and clear wake word phrase - it should only be sent once for the initial command
         val wakeWord = wakeWordPhrase.also { wakeWordPhrase = null }
@@ -491,19 +506,23 @@ class AssistViewModel internal constructor(
         ) { event ->
             when (event) {
                 is AssistEvent.Message -> {
-                    _conversation.indexOf(message).takeIf { pos -> pos >= 0 }?.let { index ->
-                        val isInput = event is AssistEvent.Message.Input
-                        val isError = event is AssistEvent.Message.Error
-                        _conversation[index] = message.copy(
-                            message = event.message.trim(),
-                            isInput = isInput,
-                            isError = isError,
-                        )
+                    val isInput = event is AssistEvent.Message.Input
+                    val isError = event is AssistEvent.Message.Error
+                    val updated = message.copy(
+                        message = event.message.trim(),
+                        isInput = isInput,
+                        isError = isError,
+                    )
+                    if (updateMessage(updated)) {
                         if (isInput) {
-                            _conversation.add(haMessage)
+                            // The reply goes right after this run's input, even if a newer run added
+                            // messages since
+                            _conversation.add(indexOfMessage() + 1, haMessage)
                             message = haMessage
+                            hasReplyChunk = false
                         }
-                        if (isError && inputMode == AssistInputMode.VOICE_ACTIVE) {
+                        // The recording belongs to the latest run
+                        if (isError && !isSuperseded && inputMode == AssistInputMode.VOICE_ACTIVE) {
                             stopRecording()
                         }
                     }
@@ -511,16 +530,16 @@ class AssistViewModel internal constructor(
                 }
 
                 is AssistEvent.MessageChunk -> {
-                    val lastMessage = _conversation.last()
-                    if (lastMessage == haMessage) {
-                        // Remove '...' message and add the chunk received
-                        _conversation.removeAt(_conversation.lastIndex)
-                        _conversation.add(lastMessage.copy(message = event.chunk))
+                    // Chunks belong to this run's reply only, never to the last message: that can be
+                    // the input or the reply of a newer run
+                    val current = message
+                    val updated = if (hasReplyChunk) {
+                        current.copy(message = current.message + event.chunk)
                     } else {
-                        // Replace last message with the updated message with the new chunk append
-                        _conversation[_conversation.lastIndex] =
-                            lastMessage.copy(message = lastMessage.message + event.chunk)
+                        // The first chunk replaces the '…' placeholder
+                        current.copy(message = event.chunk, isInput = false)
                     }
+                    if (updateMessage(updated)) hasReplyChunk = true
                 }
 
                 is AssistEvent.PipelineStarted -> { /* handled below */ }

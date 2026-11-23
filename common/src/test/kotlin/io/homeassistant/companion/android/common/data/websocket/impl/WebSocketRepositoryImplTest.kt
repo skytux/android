@@ -300,6 +300,7 @@ class WebSocketRepositoryImplTest {
                     type = SUBSCRIBE_TYPE_ASSIST_PIPELINE_RUN,
                     data = capture(dataSlot),
                     timeout = any(),
+                    reconnectPolicy = SubscriptionReconnectPolicy.Complete,
                 )
             } returns emptyFlow()
             coEvery { webSocketCore.server() } returns server
@@ -323,6 +324,7 @@ class WebSocketRepositoryImplTest {
                     type = SUBSCRIBE_TYPE_ASSIST_PIPELINE_RUN,
                     data = any(),
                     timeout = any(),
+                    reconnectPolicy = SubscriptionReconnectPolicy.Complete,
                 )
             }
 
@@ -457,6 +459,31 @@ class WebSocketRepositoryImplTest {
             @Suppress("UNCHECKED_CAST")
             val input = dataSlot.captured["input"] as Map<String, Any?>
             assertEquals(16000, input["sample_rate"])
+        }
+
+        @Test
+        fun `When running pipeline Then each run gets a subscription of its own`() = runTest {
+            captureSubscribeData()
+
+            assertNotNull(
+                repository.runAssistPipelineForVoice(
+                    sampleRate = VOICE_SAMPLE_RATE,
+                    outputTts = true,
+                    pipelineId = null,
+                    conversationId = null,
+                    wakeWordPhrase = null,
+                ),
+            )
+
+            // A shared subscription would let an identical second run join the first one
+            coVerify(exactly = 0) {
+                webSocketCore.subscribeTo<AssistPipelineEvent>(
+                    type = any(),
+                    data = any(),
+                    timeout = any(),
+                    reconnectPolicy = SubscriptionReconnectPolicy.Resubscribe,
+                )
+            }
         }
 
         @Test

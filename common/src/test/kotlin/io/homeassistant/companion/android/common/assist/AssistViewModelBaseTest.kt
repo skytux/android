@@ -500,6 +500,62 @@ class AssistViewModelBaseTest {
         assertEquals("WebSocket disconnected", viewModel.receivedErrors.first().message)
     }
 
+    @Test
+    fun `Given a newer run When the superseded run ends or fails Then the newer run keeps recording`() = runTest {
+        val firstRun = MutableSharedFlow<AssistPipelineEvent>(extraBufferCapacity = 10)
+        val secondRun = MutableSharedFlow<AssistPipelineEvent>(extraBufferCapacity = 10)
+        coEvery {
+            webSocketRepository.runAssistPipelineForVoice(any(), any(), any(), any(), any())
+        } returnsMany listOf(firstRun, secondRun)
+        val viewModel = TestAssistViewModel(audioDispatcher = StandardTestDispatcher(testScheduler))
+        val samples = shortArrayOf(1, 2, 3)
+
+        viewModel.setupRecorder()
+        viewModel.runVoicePipeline()
+        advanceUntilIdle()
+        firstRun.emit(createRunStartEvent(1))
+        firstRun.emit(createSttStartEvent())
+        firstRun.emit(createSttEndEvent())
+        advanceUntilIdle()
+
+        // A new request while the first run is still answering
+        viewModel.setupRecorder()
+        viewModel.runVoicePipeline()
+        advanceUntilIdle()
+        secondRun.emit(createRunStartEvent(2))
+        advanceUntilIdle()
+
+        firstRun.emit(createErrorEvent(code = "intent-failed", message = "Old error"))
+        firstRun.emit(AssistPipelineEvent(type = AssistPipelineEventType.RUN_END, data = null))
+        advanceUntilIdle()
+
+        assertEquals(2, viewModel.binaryHandlerId)
+        secondRun.emit(createSttStartEvent())
+        audioDataFlow.emit(samples)
+        advanceUntilIdle()
+        coVerify(exactly = 1) { webSocketRepository.sendVoiceData(2, samples.toAudioBytes()) }
+        // The superseded run still reports its own message
+        assertTrue(viewModel.receivedEvents.any { it is AssistEvent.Message.Error && it.message == "Old error" })
+    }
+
+    @Test
+    fun `Given a newer run When the superseded run reports a duplicate wake-up Then Assist is not dismissed`() = runTest {
+        val firstRun = MutableSharedFlow<AssistPipelineEvent>(extraBufferCapacity = 10)
+        val secondRun = MutableSharedFlow<AssistPipelineEvent>(extraBufferCapacity = 10)
+        coEvery {
+            webSocketRepository.runAssistPipelineForVoice(any(), any(), any(), any(), any())
+        } returnsMany listOf(firstRun, secondRun)
+        val viewModel = TestAssistViewModel(audioDispatcher = StandardTestDispatcher(testScheduler))
+
+        viewModel.runVoicePipeline()
+        viewModel.runVoicePipeline()
+        advanceUntilIdle()
+        firstRun.emit(createErrorEvent(code = "duplicate_wake_up_detected"))
+        advanceUntilIdle()
+
+        assertTrue(viewModel.receivedEvents.none { it is AssistEvent.Dismiss })
+    }
+
     private fun createRunStartEvent(handlerId: Int): AssistPipelineEvent {
         return AssistPipelineEvent(
             type = AssistPipelineEventType.RUN_START,

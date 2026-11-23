@@ -95,6 +95,15 @@ private val MIN_VERSION_SUBSCRIBE_ENTITIES_DOMAINS = HomeAssistantVersion(year =
 /** How long [WebSocketRepositoryImpl.getStates] waits for the states of a filter, like any other request. */
 private val FILTERED_STATES_TIMEOUT = 30.seconds
 
+/**
+ * Every `assist_pipeline/run` command starts a pipeline run of its own on the server. Sharing the
+ * subscription would make a second, identical command (same pipeline and conversation, for example
+ * a new voice request while a reply is still streaming) join the run in progress instead of
+ * starting one: no new run, and every event of the old run delivered to two collectors. Replaying
+ * the command after a reconnection would also start a new run nobody asked for.
+ */
+private val ASSIST_PIPELINE_RUN_RECONNECT_POLICY = SubscriptionReconnectPolicy.Complete
+
 /** Minimum server version of the `config/floor_registry/list` command (https://github.com/home-assistant/core/pull/110741). */
 private val MIN_VERSION_FLOOR_REGISTRY = HomeAssistantVersion(year = 2024, month = 3, release = 0)
 
@@ -350,6 +359,7 @@ class WebSocketRepositoryImpl internal constructor(
         return webSocketCore.subscribeTo(
             SUBSCRIBE_TYPE_ASSIST_PIPELINE_RUN,
             data,
+            reconnectPolicy = ASSIST_PIPELINE_RUN_RECONNECT_POLICY,
         )
     }
 
@@ -378,6 +388,7 @@ class WebSocketRepositoryImpl internal constructor(
         return webSocketCore.subscribeTo(
             SUBSCRIBE_TYPE_ASSIST_PIPELINE_RUN,
             data,
+            reconnectPolicy = ASSIST_PIPELINE_RUN_RECONNECT_POLICY,
         )
     }
 
