@@ -20,6 +20,7 @@ val threadPolicyIgnoredViolationRules = listOf(
     IgnoreActivityThreadVsyncDiskReadWrite,
     IgnoreSamsungInputRuneDiskRead,
     IgnoreSamsungKnoxProKioskDiskRead,
+    IgnoreSamsungKnoxVolumeButtonRotationDiskRead,
     IgnoreSamsungSpegDiskRead,
     IgnoreAndroidAutoServiceConnectionDiskRead,
     IgnoreAndroidAutoRendererServiceDiskRead,
@@ -165,6 +166,26 @@ private data object IgnoreSamsungKnoxProKioskDiskRead : IgnoreViolationRule {
             it.className == "com.samsung.android.knox.custom.ProKioskManager" &&
                 it.methodName == "getProKioskState"
         }
+    }
+}
+
+/**
+ * Ignore a [DiskReadViolation] in Samsung Knox's volume button rotation check, reached through the
+ * `dispatchVolumeKeyEvent` binder transaction.
+ *
+ * On Samsung ROMs, pressing a volume key while an app has a media session or handles the key itself
+ * makes `MediaSessionService` ask Knox (`getVolumeButtonRotationState`) whether the volume buttons
+ * follow the screen rotation, which reads Knox's settings database. The StrictMode thread policy
+ * propagates across the binder call, so the disk read is reported back to the app even though it
+ * happens inside the system service and is beyond application control. Seen on a Galaxy S24
+ * (Android 17) with the Assist dialog open.
+ */
+private data object IgnoreSamsungKnoxVolumeButtonRotationDiskRead : IgnoreViolationRule {
+    @RequiresApi(Build.VERSION_CODES.P)
+    override fun shouldIgnore(violation: Violation): Boolean {
+        if (violation !is DiskReadViolation) return false
+
+        return violation.stackTrace.any { it.methodName == "getVolumeButtonRotationState" }
     }
 }
 
